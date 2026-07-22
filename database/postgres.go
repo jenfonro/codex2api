@@ -15,6 +15,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/codex2api/internal/openaiidentity"
 	"github.com/lib/pq"
 	_ "modernc.org/sqlite"
 )
@@ -5669,8 +5670,7 @@ func (db *DB) GetAllAccessTokens(ctx context.Context) (map[string]bool, error) {
 	return result, rows.Err()
 }
 
-// GetAllChatGPTAccountIDs 获取所有已存在的 chatgpt_account_id（用于导入去重，排除已删除账号）。
-// 兼容历史字段名：account_id / chatgpt_account_id。
+// GetAllChatGPTAccountIDs 获取所有已存在的 workspace_id（用于导入去重，排除已删除账号）。
 func (db *DB) GetAllChatGPTAccountIDs(ctx context.Context) (map[string]bool, error) {
 	rows, err := db.conn.QueryContext(ctx, `SELECT credentials FROM accounts WHERE status <> 'deleted' AND COALESCE(error_message, '') <> 'deleted'`)
 	if err != nil {
@@ -5684,11 +5684,7 @@ func (db *DB) GetAllChatGPTAccountIDs(ctx context.Context) (map[string]bool, err
 		if err := rows.Scan(&raw); err != nil {
 			return nil, err
 		}
-		if id := strings.TrimSpace(credentialString(raw, "chatgpt_account_id")); id != "" {
-			result[id] = true
-			continue
-		}
-		if id := strings.TrimSpace(credentialString(raw, "account_id")); id != "" {
+		if id := openaiidentity.NormalizeWorkspaceID(credentialString(raw, "workspace_id")); id != "" {
 			result[id] = true
 		}
 	}
@@ -5696,17 +5692,12 @@ func (db *DB) GetAllChatGPTAccountIDs(ctx context.Context) (map[string]bool, err
 }
 
 // FindActiveAccountByOAuthIdentity returns the first non-deleted account with
-// the same email and OAuth identity. The identity matches when either the
-// ChatGPT workspace id (credential keys account_id / chatgpt_account_id) or
-// the OpenAI user id (credential key user_id, "user-...") equals accountID —
-// personal-plan JWTs may lack a workspace id, and legacy rows may have had
-// account_id polluted with a user_id by the old wham backfill, so matching
-// user_id against account_id keys (and vice versa) keeps dedup working for
-// both shapes.
-func (db *DB) FindActiveAccountByOAuthIdentity(ctx context.Context, email, accountID string, excludeIDs ...int64) (int64, error) {
+// the same normalized email and non-empty workspace_id. A missing workspace
+// id is intentionally not an OAuth identity and must not match another row.
+func (db *DB) FindActiveAccountByOAuthIdentity(ctx context.Context, email, workspaceID string, excludeIDs ...int64) (int64, error) {
 	email = strings.ToLower(strings.TrimSpace(email))
-	accountID = strings.TrimSpace(accountID)
-	if email == "" || accountID == "" {
+	workspaceID = strings.TrimSpace(workspaceID)
+	if email == "" || workspaceID == "" || strings.HasPrefix(strings.ToLower(workspaceID), "user-") {
 		return 0, sql.ErrNoRows
 	}
 	excluded := make(map[int64]struct{}, len(excludeIDs))
@@ -5731,17 +5722,10 @@ func (db *DB) FindActiveAccountByOAuthIdentity(ctx context.Context, email, accou
 		if _, ok := excluded[id]; ok {
 			continue
 		}
-		// 勾选"允许重复添加"强制导入的副本不作为判重锚点：后续正常导入
-		// 应命中/更新主账号，而不是把凭证写进用户故意保留的副本。
-		if strings.EqualFold(strings.TrimSpace(credentialString(raw, "allow_duplicate")), "true") {
-			continue
-		}
 		if strings.ToLower(strings.TrimSpace(credentialString(raw, "email"))) != email {
 			continue
 		}
-		if strings.TrimSpace(credentialString(raw, "account_id")) == accountID ||
-			strings.TrimSpace(credentialString(raw, "chatgpt_account_id")) == accountID ||
-			strings.TrimSpace(credentialString(raw, "user_id")) == accountID {
+		if openaiidentity.NormalizeWorkspaceID(credentialString(raw, "workspace_id")) == workspaceID {
 			return id, nil
 		}
 	}

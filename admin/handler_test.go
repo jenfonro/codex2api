@@ -735,7 +735,7 @@ func TestGetAccountAuthJSONReturnsCodexAuthFile(t *testing.T) {
 	if err := db.UpdateCredentials(context.Background(), accountID, map[string]interface{}{
 		"id_token":     "id_test",
 		"access_token": "access_test",
-		"account_id":   "account_test",
+		"workspace_id": "account_test",
 	}); err != nil {
 		t.Fatalf("seed credentials: %v", err)
 	}
@@ -2237,7 +2237,7 @@ func TestRestoreAccountRejectsDuplicateOAuthIdentity(t *testing.T) {
 	activeID, err := db.InsertAccountWithCredentials(context.Background(), "active", map[string]interface{}{
 		"refresh_token": "rt-active",
 		"email":         "restore@example.com",
-		"account_id":    "acc-restore",
+		"workspace_id":  "acc-restore",
 	}, "")
 	if err != nil {
 		t.Fatalf("Insert active: %v", err)
@@ -2245,7 +2245,7 @@ func TestRestoreAccountRejectsDuplicateOAuthIdentity(t *testing.T) {
 	deletedID, err := db.InsertAccountWithCredentials(context.Background(), "deleted", map[string]interface{}{
 		"refresh_token": "rt-deleted",
 		"email":         "Restore@Example.com",
-		"account_id":    "acc-restore",
+		"workspace_id":  "acc-restore",
 	}, "")
 	if err != nil {
 		t.Fatalf("Insert deleted: %v", err)

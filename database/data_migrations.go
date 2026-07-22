@@ -3,19 +3,21 @@ package database
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"log"
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/codex2api/internal/openaiidentity"
 )
 
 const (
 	dataMigrationOAuthIdentityDedupeV1 = "20260616_oauth_identity_dedupe_v1"
-	// v2: 身份别名补充 user_id。个人账号(无工作区 account_id)此前只按凭证原文
-	// 去重，AT 轮换后产生的重复账号 v1 清不掉；v2 把 email+user_id 也纳入别名
-	// 后重跑一次合并。
+	// v2 保留旧版本号，便于已有实例跳过已执行迁移；新的身份规则由 v3 承担。
 	dataMigrationOAuthIdentityDedupeV2 = "20260702_oauth_identity_dedupe_v2"
+	dataMigrationWorkspaceIdentityV3   = "20260722_workspace_identity_v3"
 	dataMigrationTimeout               = 5 * time.Minute
 )
 
@@ -35,7 +37,10 @@ func (db *DB) runDataMigrations(ctx context.Context) error {
 	if err := db.runDataMigrationOnce(ctx, dataMigrationOAuthIdentityDedupeV1, db.dedupeOAuthIdentityAccounts); err != nil {
 		return err
 	}
-	return db.runDataMigrationOnce(ctx, dataMigrationOAuthIdentityDedupeV2, db.dedupeOAuthIdentityAccounts)
+	if err := db.runDataMigrationOnce(ctx, dataMigrationOAuthIdentityDedupeV2, db.dedupeOAuthIdentityAccounts); err != nil {
+		return err
+	}
+	return db.runDataMigrationOnce(ctx, dataMigrationWorkspaceIdentityV3, db.backfillWorkspaceIdentity)
 }
 
 func (db *DB) runDataMigrationsWithTimeout() error {
@@ -89,6 +94,91 @@ func (db *DB) runDataMigrationOnce(ctx context.Context, version string, migrate 
 }
 
 func (db *DB) dedupeOAuthIdentityAccounts(ctx context.Context, tx *sql.Tx) error {
+	return db.dedupeOAuthIdentityAccountsWithSource(ctx, tx, "oauth_identity_dedupe_v1")
+}
+
+func (db *DB) backfillWorkspaceIdentity(ctx context.Context, tx *sql.Tx) error {
+	rows, err := tx.QueryContext(ctx, `
+		SELECT id, credentials
+		FROM accounts
+		WHERE status <> 'deleted' AND COALESCE(error_message, '') <> 'deleted'
+	`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	type update struct {
+		id          int64
+		credentials map[string]interface{}
+	}
+	var updates []update
+	for rows.Next() {
+		var id int64
+		var raw interface{}
+		if err := rows.Scan(&id, &raw); err != nil {
+			return err
+		}
+		credentials := decodeCredentials(raw)
+		workspaceID := ""
+		email := ""
+		for _, tokenKey := range []string{"id_token", "access_token"} {
+			if token := credentialStringFromMap(credentials, tokenKey); token != "" {
+				if claims, parseErr := openaiidentity.ParseJWT(token); parseErr == nil {
+					if workspaceID == "" {
+						workspaceID = claims.WorkspaceID()
+					}
+					if email == "" {
+						email = strings.TrimSpace(claims.Email)
+						if email == "" && claims.OpenAIProfile != nil {
+							email = strings.TrimSpace(claims.OpenAIProfile.Email)
+						}
+					}
+					if workspaceID != "" && email != "" {
+						break
+					}
+				}
+			}
+		}
+		storedWorkspaceRaw := strings.TrimSpace(credentialStringFromMap(credentials, "workspace_id"))
+		storedWorkspaceID := openaiidentity.NormalizeWorkspaceID(storedWorkspaceRaw)
+		storedEmail := strings.TrimSpace(credentialStringFromMap(credentials, "email"))
+		workspaceNeedsUpdate := storedWorkspaceRaw != storedWorkspaceID || (workspaceID != "" && workspaceID != storedWorkspaceID)
+		if !workspaceNeedsUpdate && (email == "" || storedEmail != "") {
+			continue
+		}
+		if workspaceID != "" {
+			credentials["workspace_id"] = workspaceID
+		} else if storedWorkspaceRaw != "" && storedWorkspaceID == "" {
+			// 清理历史 wham 回填或外部导入留下的 user-* 污染值；空值不参与身份去重。
+			credentials["workspace_id"] = ""
+		}
+		if storedEmail == "" && email != "" {
+			credentials["email"] = email
+		}
+		updates = append(updates, update{id: id, credentials: credentials})
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for _, item := range updates {
+		encoded, err := json.Marshal(item.credentials)
+		if err != nil {
+			return fmt.Errorf("序列化账号 %d credentials 失败: %w", item.id, err)
+		}
+		// 回填不刷新 updated_at，避免迁移改变重复账号的胜出顺序。
+		query := `UPDATE accounts SET credentials = $1 WHERE id = $2`
+		if !db.isSQLite() {
+			query = `UPDATE accounts SET credentials = $1::jsonb WHERE id = $2`
+		}
+		if _, err := tx.ExecContext(ctx, query, encoded, item.id); err != nil {
+			return fmt.Errorf("回填账号 %d workspace_id 失败: %w", item.id, err)
+		}
+	}
+	return db.dedupeOAuthIdentityAccountsWithSource(ctx, tx, "workspace_identity_v3")
+}
+
+func (db *DB) dedupeOAuthIdentityAccountsWithSource(ctx context.Context, tx *sql.Tx, source string) error {
 	accounts, err := db.listOAuthIdentityDedupeAccounts(ctx, tx)
 	if err != nil {
 		return err
@@ -160,10 +250,10 @@ func (db *DB) dedupeOAuthIdentityAccounts(ctx context.Context, tx *sql.Tx) error
 	if err := softDeleteAccountsTx(ctx, tx, loserIDs); err != nil {
 		return err
 	}
-	if err := insertAccountEventsTx(ctx, tx, loserIDs, "deleted", "oauth_identity_dedupe_v1"); err != nil {
+	if err := insertAccountEventsTx(ctx, tx, loserIDs, "deleted", source); err != nil {
 		return err
 	}
-	log.Printf("[data_migration] %s: 发现 %d 组重复 OAuth 身份，已软删除 %d 个重复账号", dataMigrationOAuthIdentityDedupeV1, duplicateGroups, len(loserIDs))
+	log.Printf("[data_migration] %s: 发现 %d 组重复 OAuth 身份，已软删除 %d 个重复账号", source, duplicateGroups, len(loserIDs))
 	return nil
 }
 
@@ -212,31 +302,15 @@ func (db *DB) listOAuthIdentityDedupeAccounts(ctx context.Context, tx *sql.Tx) (
 }
 
 func oauthIdentityDedupeAliases(credentials map[string]interface{}) []string {
-	// 用户勾选"允许重复添加"强制导入的副本带 allow_duplicate 标记，
-	// 是故意保留的重复（如同一账号配不同代理），不得参与合并。
-	if strings.EqualFold(strings.TrimSpace(credentialStringFromMap(credentials, "allow_duplicate")), "true") {
-		return nil
-	}
 	email := strings.ToLower(strings.TrimSpace(credentialStringFromMap(credentials, "email")))
 	if email == "" {
 		return nil
 	}
-	seen := make(map[string]struct{}, 2)
-	// user_id 也是身份别名：个人账号可能没有工作区 account_id，且旧版 wham
-	// 回填曾把 user_id 写进 account_id 字段，两种形态要能合并到同一组。
-	for _, key := range []string{"account_id", "chatgpt_account_id", "user_id"} {
-		accountID := strings.TrimSpace(credentialStringFromMap(credentials, key))
-		if accountID == "" {
-			continue
-		}
-		seen[email+"\x00"+accountID] = struct{}{}
+	workspaceID := openaiidentity.NormalizeWorkspaceID(credentialStringFromMap(credentials, "workspace_id"))
+	if workspaceID == "" {
+		return nil
 	}
-	aliases := make([]string, 0, len(seen))
-	for alias := range seen {
-		aliases = append(aliases, alias)
-	}
-	sort.Strings(aliases)
-	return aliases
+	return []string{email + "\x00" + workspaceID}
 }
 
 func credentialStringFromMap(credentials map[string]interface{}, key string) string {

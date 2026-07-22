@@ -33,6 +33,7 @@ import (
 	"github.com/codex2api/cache"
 	"github.com/codex2api/database"
 	"github.com/codex2api/internal/imagestore"
+	"github.com/codex2api/internal/openaiidentity"
 	"github.com/codex2api/proxy"
 	"github.com/codex2api/security"
 	"github.com/codex2api/security/promptfilter"
@@ -89,9 +90,9 @@ type Handler struct {
 	resetCreditPostClosed     bool
 	settingsUpdateMu          sync.Mutex
 
-	// 重复账号合并互斥锁：串行化 mergeRefreshedDuplicateIntoExisting，
-	// 防止并发导入同一身份的多个账号时互相合并、把双方都软删（账号丢失）。
-	mergeDuplicateMu sync.Mutex
+	// OAuth workspace 身份互斥锁：串行化身份查询、更新和合并，避免并发导入
+	// 同一 email + workspace_id 时同时通过查询并各自插入。
+	oauthIdentityMu sync.Mutex
 }
 
 type chartCacheEntry struct {
@@ -182,7 +183,7 @@ func (h *Handler) probeImportedAccountUsage(ctx context.Context, accountID int64
 		log.Printf("导入账号 %d 用量采样失败 (%s): %v", accountID, source, err)
 		return
 	}
-	// AT / codex_at 账号的 OAuth 身份（email + account_id）在插入时无法从
+	// AT / codex_at 账号的 OAuth 身份（email + workspace_id）在插入时无法从
 	// JWT 解出，由上面的 wham 探针补齐并落库。身份既已可知，此刻回查是否与
 	// 已有账号同一身份：若重复则把凭证合并进旧账号并软删本账号——与 RT 路径
 	// refreshImportedAccountAndProbe 对称，补上 AT 导入/添加事后无法去重的缺口
@@ -230,8 +231,8 @@ func (h *Handler) mergeRefreshedDuplicateIntoExisting(newID int64, source string
 	}
 	// 串行化合并：并发导入同一身份的多个账号时，两个合并流程若交错执行，
 	// 可能互相把对方选为“已有账号”，导致双方都被软删（账号丢失）。
-	h.mergeDuplicateMu.Lock()
-	defer h.mergeDuplicateMu.Unlock()
+	h.oauthIdentityMu.Lock()
+	defer h.oauthIdentityMu.Unlock()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -240,28 +241,18 @@ func (h *Handler) mergeRefreshedDuplicateIntoExisting(newID int64, source string
 	if err != nil || newRow == nil {
 		return false
 	}
-	// 勾选"允许重复添加"导入的副本是用户故意保留的，不合并。
-	if strings.EqualFold(strings.TrimSpace(newRow.GetCredential("allow_duplicate")), "true") {
-		return false
-	}
 	email := strings.TrimSpace(newRow.GetCredential("email"))
-	identity := strings.TrimSpace(newRow.GetCredential("account_id"))
-	if identity == "" {
-		identity = strings.TrimSpace(newRow.GetCredential("chatgpt_account_id"))
-	}
-	if identity == "" {
-		identity = strings.TrimSpace(newRow.GetCredential("user_id"))
-	}
-	if email == "" || identity == "" {
+	workspaceID := strings.TrimSpace(newRow.GetCredential("workspace_id"))
+	if email == "" || workspaceID == "" {
 		return false
 	}
-	oldID, err := h.db.FindActiveAccountByOAuthIdentity(ctx, email, identity, newID)
+	oldID, err := h.db.FindActiveAccountByOAuthIdentity(ctx, email, workspaceID, newID)
 	if err != nil || oldID <= 0 {
 		return false
 	}
 
 	updates := make(map[string]interface{})
-	for _, key := range []string{"refresh_token", "session_token", "access_token", "access_token_type", "id_token", "expires_at", "email", "account_id", "user_id", "plan_type", "subscription_expires_at"} {
+	for _, key := range []string{"refresh_token", "session_token", "access_token", "access_token_type", "id_token", "expires_at", "email", "workspace_id", "user_id", "plan_type", "subscription_expires_at"} {
 		if v := strings.TrimSpace(newRow.GetCredential(key)); v != "" {
 			updates[key] = v
 		}
@@ -888,7 +879,7 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 			Name:                     row.Name,
 			Email:                    email,
 			EmailDomain:              accountEmailDomain(email),
-			ChatGPTAccountID:         row.GetCredential("account_id"),
+			ChatGPTAccountID:         accountWorkspaceID(row),
 			PlanType:                 planType,
 			SubscriptionExpiresAt:    row.GetCredential("subscription_expires_at"),
 			Status:                   row.Status,
@@ -2351,8 +2342,9 @@ func (h *Handler) AddATAccount(c *gin.Context) {
 
 	// AT 去重：非身份型 AT-only（无法从 JWT 解出 email + 工作区/用户 ID，如 codex_at）
 	// 按 access_token 原文去重；身份型 AT 由 upsertOAuthIdentityAccount 按 OAuth 身份
-	//（email + account_id/user_id）去重/更新——AT 会轮换，仅按原文去重会重复导入同一账号。
-	// 勾选"允许重复添加"时跳过全部去重，强制新建。
+	//（email + workspace_id）去重/更新；workspace_id 缺失时只按凭证原文去重。
+	// workspace_id 为空时，勾选"允许重复添加"可跳过凭证原文去重；
+	// 已确认 workspace 身份时仍按 OAuth 身份更新已有账号。
 	existingATs := make(map[string]bool)
 	seenAT := make(map[string]bool)
 	if !req.AllowDuplicate {
@@ -2376,7 +2368,7 @@ func (h *Handler) AddATAccount(c *gin.Context) {
 			allowDuplicate: req.AllowDuplicate,
 			customHeaders:  customHeaders,
 		})
-		if !req.AllowDuplicate && seed.email != "" && (seed.accountID != "" || seed.userID != "") {
+		if seed.email != "" && seed.workspaceID != "" {
 			id, updated, err := h.upsertOAuthIdentityAccount(ctx, name, req.ProxyURL, seed, "manual_at")
 			if err != nil {
 				log.Printf("添加 AT 账号 %d 失败: %v", i+1, err)
@@ -2495,7 +2487,7 @@ func (h *Handler) streamAddATAccounts(c *gin.Context, req addATAccountReq, token
 		}
 
 		seed := normalizeTokenCredentialSeed(tokenCredentialSeed{accessToken: at, allowDuplicate: req.AllowDuplicate, customHeaders: req.CustomHeaders})
-		if !req.AllowDuplicate && seed.email != "" && (seed.accountID != "" || seed.userID != "") {
+		if seed.email != "" && seed.workspaceID != "" {
 			id, updated, err := h.upsertOAuthIdentityAccount(ctx, name, req.ProxyURL, seed, "manual_at")
 			if err != nil {
 				log.Printf("添加 AT 账号 %d 失败: %v", i+1, err)
@@ -3016,8 +3008,7 @@ type importToken struct {
 	name                  string
 	email                 string
 	idToken               string
-	accountID             string
-	chatgptAccountID      string // sub2api 等导出格式中的 ChatGPT 账号唯一标识，用于精确去重
+	workspaceID           string // canonical value supplied by a trusted parser or test fixture
 	planType              string
 	expiresAt             string
 	codex7DUsedPercent    string
@@ -3030,13 +3021,15 @@ type importToken struct {
 
 // jsonAccountEntry CLIProxyAPI 凭证 JSON 条目
 type jsonAccountEntry struct {
-	RefreshToken          string                 `json:"refresh_token"`
-	SessionToken          string                 `json:"session_token"`
-	SessionTokenCamel     string                 `json:"sessionToken"`
-	AccessToken           string                 `json:"access_token"`
-	AccessTokenCamel      string                 `json:"accessToken"`
-	IDToken               string                 `json:"id_token"`
-	IDTokenCamel          string                 `json:"idToken"`
+	RefreshToken      string `json:"refresh_token"`
+	SessionToken      string `json:"session_token"`
+	SessionTokenCamel string `json:"sessionToken"`
+	AccessToken       string `json:"access_token"`
+	AccessTokenCamel  string `json:"accessToken"`
+	IDToken           string `json:"id_token"`
+	IDTokenCamel      string `json:"idToken"`
+	// Legacy exporter fields are accepted for format compatibility only; the
+	// canonical identity is derived from the JWT into workspace_id.
 	AccountID             string                 `json:"account_id"`
 	ChatGPTAccountID      string                 `json:"chatgpt_account_id"`
 	Email                 string                 `json:"email"`
@@ -3054,6 +3047,14 @@ type jsonAccountEntry struct {
 	Codex5HResetAt        string                 `json:"codex_5h_reset_at"`
 	Codex5HUsageUpdatedAt string                 `json:"codex_5h_usage_updated_at"`
 	CodexUsageUpdatedAt   string                 `json:"codex_usage_updated_at"`
+	Tokens                jsonAccountTokens      `json:"tokens"`
+}
+
+type jsonAccountTokens struct {
+	RefreshToken string `json:"refresh_token"`
+	AccessToken  string `json:"access_token"`
+	IDToken      string `json:"id_token"`
+	AccountID    string `json:"account_id"` // legacy metadata; never used for identity
 }
 
 type jsonAccountUser struct {
@@ -3085,8 +3086,8 @@ type sub2apiAccountCredentials struct {
 	AccessTokenCamel      string                 `json:"accessToken"`
 	IDToken               string                 `json:"id_token"`
 	IDTokenCamel          string                 `json:"idToken"`
-	AccountID             string                 `json:"account_id"`
-	ChatGPTAccountID      string                 `json:"chatgpt_account_id"`
+	AccountID             string                 `json:"account_id"`         // legacy metadata
+	ChatGPTAccountID      string                 `json:"chatgpt_account_id"` // legacy metadata
 	Email                 string                 `json:"email"`
 	PlanType              string                 `json:"plan_type"`
 	PlanTypeCamel         string                 `json:"planType"`
@@ -3173,14 +3174,13 @@ func parseFlatJSONImportTokens(data []byte) []importToken {
 func jsonAccountEntriesToTokens(entries []jsonAccountEntry) []importToken {
 	tokens := make([]importToken, 0, len(entries))
 	for _, entry := range entries {
-		rt := strings.TrimSpace(entry.RefreshToken)
+		rt := firstNonEmpty(entry.RefreshToken, entry.Tokens.RefreshToken)
 		st := firstNonEmpty(entry.SessionToken, entry.SessionTokenCamel)
-		at := firstNonEmpty(entry.AccessToken, entry.AccessTokenCamel)
-		idTok := firstNonEmpty(entry.IDToken, entry.IDTokenCamel)
+		at := firstNonEmpty(entry.AccessToken, entry.AccessTokenCamel, entry.Tokens.AccessToken)
+		idTok := firstNonEmpty(entry.IDToken, entry.IDTokenCamel, entry.Tokens.IDToken)
 		email := firstNonEmpty(entry.Email, entry.User.Email)
 		name := firstNonEmpty(entry.Name, entry.User.Name, email)
 		planType := firstNonEmpty(entry.PlanType, entry.PlanTypeCamel, entry.Account.PlanType, entry.Account.PlanTypeCamel)
-		accID := firstNonEmpty(entry.AccountID, entry.User.ID, entry.Account.ID)
 		expiresAt := firstNonEmpty(entry.ExpiresAt.String(), entry.Expired.String(), entry.Expires.String())
 
 		if rt != "" || st != "" || at != "" {
@@ -3191,8 +3191,6 @@ func jsonAccountEntriesToTokens(entries []jsonAccountEntry) []importToken {
 				name:                  name,
 				email:                 email,
 				idToken:               idTok,
-				accountID:             strings.TrimSpace(entry.AccountID),
-				chatgptAccountID:      firstNonEmpty(entry.ChatGPTAccountID, accID),
 				planType:              planType,
 				expiresAt:             expiresAt,
 				codex7DUsedPercent:    strings.TrimSpace(entry.Codex7DUsedPercent.String()),
@@ -3227,7 +3225,6 @@ func parseSub2APIJSONImportTokens(data []byte) []importToken {
 			name = email
 		}
 		planType := firstNonEmpty(c.PlanType, c.PlanTypeCamel, c.Account.PlanType, c.Account.PlanTypeCamel)
-		accID := firstNonEmpty(c.AccountID, c.User.ID, c.Account.ID)
 		expiresAt := firstNonEmpty(c.ExpiresAt.String(), c.Expired.String(), c.Expires.String())
 
 		if rt != "" || st != "" || at != "" {
@@ -3238,8 +3235,6 @@ func parseSub2APIJSONImportTokens(data []byte) []importToken {
 				name:                  name,
 				email:                 email,
 				idToken:               idTok,
-				accountID:             strings.TrimSpace(c.AccountID),
-				chatgptAccountID:      firstNonEmpty(c.ChatGPTAccountID, accID),
 				planType:              planType,
 				expiresAt:             expiresAt,
 				codex7DUsedPercent:    strings.TrimSpace(c.Codex7DUsedPercent.String()),
@@ -3255,25 +3250,12 @@ func parseSub2APIJSONImportTokens(data []byte) []importToken {
 	return tokens
 }
 
-func importTokenCredentialIdentity(t importToken) string {
-	switch {
-	case t.refreshToken != "":
-		return "rt:" + t.refreshToken
-	case t.sessionToken != "":
-		return "st:" + t.sessionToken
-	case t.accessToken != "":
-		return "at:" + t.accessToken
-	default:
-		return ""
-	}
-}
-
 func importCredentialFingerprint(refreshToken, sessionToken, accessToken string) string {
 	return strings.TrimSpace(refreshToken) + "\x00" + strings.TrimSpace(sessionToken) + "\x00" + strings.TrimSpace(accessToken)
 }
 
-func importTokenCredentialFingerprint(t importToken, conflicts map[string]bool) string {
-	seed := importTokenSeed(t, conflicts)
+func importTokenCredentialFingerprint(t importToken) string {
+	seed := importTokenSeed(t)
 	return importCredentialFingerprint(seed.refreshToken, seed.sessionToken, seed.accessToken)
 }
 
@@ -3288,56 +3270,13 @@ func importAccountCredentialFingerprint(row *database.AccountRow) string {
 	)
 }
 
-func conflictingImportChatGPTIDs(tokens []importToken) map[string]bool {
-	identitiesByID := make(map[string]map[string]struct{})
-	for _, t := range tokens {
-		id := strings.TrimSpace(t.chatgptAccountID)
-		if id == "" {
-			continue
-		}
-		identity := importTokenCredentialIdentity(t)
-		if identity == "" {
-			continue
-		}
-		identities := identitiesByID[id]
-		if identities == nil {
-			identities = make(map[string]struct{}, 1)
-			identitiesByID[id] = identities
-		}
-		identities[identity] = struct{}{}
-	}
-
-	conflicts := make(map[string]bool)
-	for id, identities := range identitiesByID {
-		if len(identities) > 1 {
-			conflicts[id] = true
-		}
-	}
-	return conflicts
-}
-
-func reliableImportChatGPTID(t importToken, conflicts map[string]bool) string {
-	id := strings.TrimSpace(t.chatgptAccountID)
-	if id == "" || conflicts[id] {
-		return ""
-	}
-	return id
-}
-
-func importStoredAccountID(t importToken, conflicts map[string]bool) string {
-	if strings.TrimSpace(t.accountID) != "" {
-		return strings.TrimSpace(t.accountID)
-	}
-	return reliableImportChatGPTID(t, conflicts)
-}
-
-func importTokenSeed(t importToken, conflicts map[string]bool) tokenCredentialSeed {
+func importTokenSeed(t importToken) tokenCredentialSeed {
 	return normalizeTokenCredentialSeed(tokenCredentialSeed{
 		refreshToken:          t.refreshToken,
 		sessionToken:          t.sessionToken,
 		accessToken:           t.accessToken,
 		idToken:               t.idToken,
-		accountID:             importStoredAccountID(t, conflicts),
+		workspaceID:           t.workspaceID,
 		email:                 t.email,
 		planType:              t.planType,
 		expiresAtRaw:          t.expiresAt,
@@ -3350,22 +3289,14 @@ func importTokenSeed(t importToken, conflicts map[string]bool) tokenCredentialSe
 	})
 }
 
-func importTokenOAuthIdentityKey(t importToken, conflicts map[string]bool) string {
-	seed := importTokenSeed(t, conflicts)
+func importTokenOAuthIdentityKey(t importToken) string {
+	seed := importTokenSeed(t)
 	email := strings.ToLower(strings.TrimSpace(seed.email))
-	accountID := strings.TrimSpace(seed.accountID)
-	if accountID == "" && strings.TrimSpace(t.accountID) == "" {
-		accountID = strings.TrimSpace(t.chatgptAccountID)
-	}
-	// 个人账号可能只有 user_id（无工作区 account_id），用它兜底做身份键，
-	// 否则文件导入会退化为凭证原文比对，AT 轮换后重复导入。
-	if accountID == "" {
-		accountID = strings.TrimSpace(seed.userID)
-	}
-	if email == "" || accountID == "" {
+	workspaceID := strings.TrimSpace(seed.workspaceID)
+	if email == "" || workspaceID == "" {
 		return ""
 	}
-	return email + "\x00" + accountID
+	return email + "\x00" + workspaceID
 }
 
 // ImportAccounts 批量导入账号（支持 TXT / JSON）
@@ -3642,19 +3573,16 @@ func sendSSEJSON(c *gin.Context, event any) {
 func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, proxyURL string, allowDuplicate bool, customHeaders ...map[string]string) {
 	importCustomHeaders := firstCustomHeaders(customHeaders)
 	// 文件内去重：
-	// 1) 当条目可解析出 email + account_id 时，以它作为 OAuth 身份键；
+	// 1) 当 JWT 可解析出 email + workspace_id 时，以它作为 OAuth 身份键；
 	//    同身份同 RT/ST/AT 折叠，同身份不同 RT/ST/AT 整组跳过，避免任选一个覆盖。
-	// 2) 没有 OAuth 身份时，退回到 RT / ST / AT 顺序去重（兼容旧导出格式）。
-	// 3) 同一份文件内若出现"同一个 RT 对应多个不同 chatgpt_account_id"，
-	//    会被全部保留为独立账号；数据库层面 refresh_token 没有 UNIQUE 约束，因此安全。
-	conflictingChatGPTIDs := conflictingImportChatGPTIDs(tokens)
+	// 2) workspace_id 为空时不做身份去重；未开启允许重复时仍按 RT / ST / AT 原文去重。
 	type oauthIdentityImportState struct {
 		count        int
 		fingerprints map[string]struct{}
 	}
 	oauthIdentityStates := make(map[string]*oauthIdentityImportState)
 	for _, t := range tokens {
-		oauthIdentity := importTokenOAuthIdentityKey(t, conflictingChatGPTIDs)
+		oauthIdentity := importTokenOAuthIdentityKey(t)
 		if oauthIdentity == "" {
 			continue
 		}
@@ -3664,7 +3592,7 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 			oauthIdentityStates[oauthIdentity] = state
 		}
 		state.count++
-		state.fingerprints[importTokenCredentialFingerprint(t, conflictingChatGPTIDs)] = struct{}{}
+		state.fingerprints[importTokenCredentialFingerprint(t)] = struct{}{}
 	}
 
 	seenOAuthIdentity := make(map[string]bool)
@@ -3674,7 +3602,7 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 	var unique []importToken
 	ambiguousOAuthIdentityCount := 0
 	for _, t := range tokens {
-		oauthIdentity := importTokenOAuthIdentityKey(t, conflictingChatGPTIDs)
+		oauthIdentity := importTokenOAuthIdentityKey(t)
 		if oauthIdentity != "" {
 			state := oauthIdentityStates[oauthIdentity]
 			if state != nil && len(state.fingerprints) > 1 {
@@ -3697,6 +3625,10 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 			if t.accessToken != "" {
 				seenAT[t.accessToken] = true
 			}
+			unique = append(unique, t)
+			continue
+		}
+		if allowDuplicate {
 			unique = append(unique, t)
 			continue
 		}
@@ -3740,88 +3672,73 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 	var newTokens []importToken
 	duplicateCount := ambiguousOAuthIdentityCount
 
-	if allowDuplicate {
-		// 允许重复添加：跳过数据库去重，所有解析出的 token 均作为新账号导入。
-		newTokens = tokens
-		duplicateCount = 0
-	} else {
-		existingRTs, err := h.db.GetAllRefreshTokens(dedupeCtx)
-		if err != nil {
+	existingRTs := make(map[string]bool)
+	existingSTs := make(map[string]bool)
+	existingATs := make(map[string]bool)
+	if !allowDuplicate {
+		var err error
+		if existingRTs, err = h.db.GetAllRefreshTokens(dedupeCtx); err != nil {
 			log.Printf("查询已有 RT 失败: %v", err)
 			existingRTs = make(map[string]bool)
 		}
-
-		// 存在 AT-only token 时额外查询已有 AT
-		hasAT := len(seenAT) > 0
-		var existingATs map[string]bool
-		if hasAT {
-			existingATs, err = h.db.GetAllAccessTokens(dedupeCtx)
-			if err != nil {
-				log.Printf("查询已有 AT 失败: %v", err)
-				existingATs = make(map[string]bool)
-			}
-		}
-		hasST := len(seenST) > 0
-		var existingSTs map[string]bool
-		if hasST {
-			existingSTs, err = h.db.GetAllSessionTokens(dedupeCtx)
-			if err != nil {
+		if len(seenST) > 0 {
+			if existingSTs, err = h.db.GetAllSessionTokens(dedupeCtx); err != nil {
 				log.Printf("查询已有 ST 失败: %v", err)
 				existingSTs = make(map[string]bool)
 			}
 		}
-
-		for _, t := range unique {
-			oauthIdentity := importTokenOAuthIdentityKey(t, conflictingChatGPTIDs)
-			if oauthIdentity != "" {
-				seed := importTokenSeed(t, conflictingChatGPTIDs)
-				if duplicateID, err := h.findOAuthIdentityDuplicate(dedupeCtx, seed, 0); err != nil {
-					log.Printf("查询已有 OAuth 身份失败: %v", err)
-				} else if duplicateID > 0 {
-					row, err := h.db.GetAccountByID(dedupeCtx, duplicateID)
-					if err != nil {
-						log.Printf("查询已有 OAuth 账号 %d 失败: %v", duplicateID, err)
-					} else if importAccountCredentialFingerprint(row) == importTokenCredentialFingerprint(t, conflictingChatGPTIDs) {
-						duplicateCount++
-						continue
-					}
-				}
-				newTokens = append(newTokens, t)
-				continue
+		if len(seenAT) > 0 {
+			if existingATs, err = h.db.GetAllAccessTokens(dedupeCtx); err != nil {
+				log.Printf("查询已有 AT 失败: %v", err)
+				existingATs = make(map[string]bool)
 			}
-			switch {
-			case t.refreshToken != "":
-				if existingRTs[t.refreshToken] {
+		}
+	}
+
+	for _, t := range unique {
+		if importTokenOAuthIdentityKey(t) != "" {
+			seed := importTokenSeed(t)
+			if duplicateID, err := h.findOAuthIdentityDuplicate(dedupeCtx, seed, 0); err != nil {
+				log.Printf("查询已有 OAuth 身份失败: %v", err)
+			} else if duplicateID > 0 {
+				row, err := h.db.GetAccountByID(dedupeCtx, duplicateID)
+				if err != nil {
+					log.Printf("查询已有 OAuth 账号 %d 失败: %v", duplicateID, err)
+				} else if importAccountCredentialFingerprint(row) == importTokenCredentialFingerprint(t) {
 					duplicateCount++
-				} else if t.sessionToken != "" && existingSTs[t.sessionToken] {
-					duplicateCount++
-				} else if t.accessToken != "" && existingATs[t.accessToken] {
-					duplicateCount++
-				} else {
-					newTokens = append(newTokens, t)
+					continue
 				}
-			case t.sessionToken != "":
-				if existingSTs[t.sessionToken] {
-					duplicateCount++
-				} else if t.accessToken != "" && existingATs[t.accessToken] {
-					duplicateCount++
-				} else {
-					newTokens = append(newTokens, t)
-				}
-			case t.accessToken != "":
-				if existingATs[t.accessToken] {
-					duplicateCount++
-				} else {
-					newTokens = append(newTokens, t)
-				}
+			}
+			newTokens = append(newTokens, t)
+			continue
+		}
+		if allowDuplicate {
+			newTokens = append(newTokens, t)
+			continue
+		}
+		switch {
+		case t.refreshToken != "":
+			if existingRTs[t.refreshToken] || t.sessionToken != "" && existingSTs[t.sessionToken] || t.accessToken != "" && existingATs[t.accessToken] {
+				duplicateCount++
+			} else {
+				newTokens = append(newTokens, t)
+			}
+		case t.sessionToken != "":
+			if existingSTs[t.sessionToken] || t.accessToken != "" && existingATs[t.accessToken] {
+				duplicateCount++
+			} else {
+				newTokens = append(newTokens, t)
+			}
+		case t.accessToken != "":
+			if existingATs[t.accessToken] {
+				duplicateCount++
+			} else {
+				newTokens = append(newTokens, t)
 			}
 		}
 	}
 
 	total := len(unique) + ambiguousOAuthIdentityCount
-	if allowDuplicate {
-		total = len(tokens)
-	}
 
 	log.Printf("导入去重: 总计 %d 条, 数据库已存在 %d 条, 待导入 %d 条", total, duplicateCount, len(newTokens))
 
@@ -3877,14 +3794,14 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 
 			name := tok.name
 
-			seed := importTokenSeed(tok, conflictingChatGPTIDs)
+			seed := importTokenSeed(tok)
 			seed.allowDuplicate = allowDuplicate
 			seed.customHeaders = cloneCustomHeaders(importCustomHeaders)
 			importSource := "import"
 			if tok.accessToken != "" && tok.refreshToken == "" {
 				importSource = "import_at"
 			}
-			if !allowDuplicate && seed.email != "" && (seed.accountID != "" || seed.userID != "") {
+			if seed.email != "" && seed.workspaceID != "" {
 				if name == "" {
 					if importSource == "import_at" {
 						name = fmt.Sprintf("at-import-%d", idx+1)
@@ -4248,6 +4165,10 @@ func (h *Handler) restoreAccountByID(ctx context.Context, id int64) error {
 		return err
 	}
 	seed := tokenCredentialSeedFromAccountRow(row)
+	if seed.email != "" && seed.workspaceID != "" {
+		h.oauthIdentityMu.Lock()
+		defer h.oauthIdentityMu.Unlock()
+	}
 	if duplicateID, err := h.findOAuthIdentityDuplicate(ctx, seed, id); err != nil {
 		return err
 	} else if duplicateID > 0 {
@@ -4276,7 +4197,7 @@ func tokenCredentialSeedFromAccountRow(row *database.AccountRow) tokenCredential
 		sessionToken:          row.GetCredential("session_token"),
 		accessToken:           row.GetCredential("access_token"),
 		idToken:               row.GetCredential("id_token"),
-		accountID:             firstNonEmpty(row.GetCredential("account_id"), row.GetCredential("chatgpt_account_id")),
+		workspaceID:           row.GetCredential("workspace_id"),
 		email:                 row.GetCredential("email"),
 		planType:              row.GetCredential("plan_type"),
 		expiresAtRaw:          row.GetCredential("expires_at"),
@@ -8227,6 +8148,18 @@ type accountAuthJSONTokens struct {
 	AccountID    string `json:"account_id"`
 }
 
+func accountWorkspaceID(row *database.AccountRow) string {
+	if row == nil {
+		return ""
+	}
+	if info := accountInfoFromTokens(row.GetCredential("id_token"), row.GetCredential("access_token")); info != nil {
+		if workspaceID := strings.TrimSpace(info.ChatGPTAccountID); workspaceID != "" {
+			return workspaceID
+		}
+	}
+	return openaiidentity.NormalizeWorkspaceID(row.GetCredential("workspace_id"))
+}
+
 type accountAuthJSON struct {
 	AuthMode     string                `json:"auth_mode"`
 	OpenAIAPIKey *string               `json:"OPENAI_API_KEY"`
@@ -8258,7 +8191,7 @@ func (h *Handler) GetAccountAuthJSON(c *gin.Context) {
 	refreshToken := row.GetCredential("refresh_token")
 	accessToken := row.GetCredential("access_token")
 	idToken := row.GetCredential("id_token")
-	accountID := row.GetCredential("account_id")
+	accountID := accountWorkspaceID(row)
 	if refreshToken == "" {
 		writeError(c, http.StatusBadRequest, "该账号没有 refresh_token，无法生成 auth.json")
 		return
@@ -8308,11 +8241,7 @@ func accountRowToCPAExportEntry(row *database.AccountRow) (cpaExportEntry, bool)
 	if rt == "" && at == "" {
 		return cpaExportEntry{}, false
 	}
-	// account_id 在凭据中存储为 chatgpt_account_id（新字段）或 account_id（历史字段）
-	accountID := row.GetCredential("chatgpt_account_id")
-	if accountID == "" {
-		accountID = row.GetCredential("account_id")
-	}
+	accountID := accountWorkspaceID(row)
 	return cpaExportEntry{
 		Type:                  "codex",
 		Email:                 row.GetCredential("email"),
@@ -8521,7 +8450,6 @@ func (h *Handler) MigrateAccounts(c *gin.Context) {
 			name:                  name,
 			email:                 strings.TrimSpace(entry.Email),
 			idToken:               strings.TrimSpace(entry.IDToken),
-			accountID:             strings.TrimSpace(entry.AccountID),
 			planType:              strings.TrimSpace(entry.PlanType),
 			expiresAt:             strings.TrimSpace(entry.Expired),
 			codex7DUsedPercent:    strings.TrimSpace(entry.Codex7DUsedPercent),

@@ -3,6 +3,8 @@ package database
 import (
 	"context"
 	"database/sql"
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"math"
 	"path/filepath"
@@ -11,6 +13,15 @@ import (
 	"testing"
 	"time"
 )
+
+func databaseTestJWT(t *testing.T, claims map[string]interface{}) string {
+	t.Helper()
+	payload, err := json.Marshal(claims)
+	if err != nil {
+		t.Fatalf("json.Marshal: %v", err)
+	}
+	return "header." + base64.RawURLEncoding.EncodeToString(payload) + ".signature"
+}
 
 func TestNewSQLiteInitializesFreshDatabase(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
@@ -192,9 +203,9 @@ func TestFindActiveAccountByOAuthIdentity(t *testing.T) {
 
 	ctx := context.Background()
 	id, err := db.InsertAccountWithCredentials(ctx, "identity", map[string]interface{}{
-		"refresh_token":      "rt-identity",
-		"email":              "User@Example.COM",
-		"chatgpt_account_id": "acc-identity",
+		"refresh_token": "rt-identity",
+		"email":         "User@Example.COM",
+		"workspace_id":  "acc-identity",
 	}, "")
 	if err != nil {
 		t.Fatalf("InsertAccountWithCredentials 返回错误: %v", err)
@@ -211,7 +222,7 @@ func TestFindActiveAccountByOAuthIdentity(t *testing.T) {
 	otherID, err := db.InsertAccountWithCredentials(ctx, "identity-other", map[string]interface{}{
 		"refresh_token": "rt-identity-other",
 		"email":         "user@example.com",
-		"account_id":    "acc-identity",
+		"workspace_id":  "acc-identity",
 	}, "")
 	if err != nil {
 		t.Fatalf("InsertAccountWithCredentials other 返回错误: %v", err)
@@ -237,10 +248,8 @@ func TestFindActiveAccountByOAuthIdentity(t *testing.T) {
 	}
 }
 
-// 个人账号 JWT 可能没有工作区 account_id，只有 user_id（user-...）；此外旧版
-// wham 回填曾把 user_id 写进 account_id 字段。身份匹配必须两个键都认，
-// 否则 AT 轮换后同一账号会被重复导入。
-func TestFindActiveAccountByOAuthIdentityMatchesUserID(t *testing.T) {
+// 缺少 workspace_id 时不按 user_id 或历史 account_id 污染值进行身份匹配。
+func TestFindActiveAccountByOAuthIdentityIgnoresUserID(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
 
 	db, err := New("sqlite", dbPath)
@@ -251,7 +260,7 @@ func TestFindActiveAccountByOAuthIdentityMatchesUserID(t *testing.T) {
 
 	ctx := context.Background()
 
-	// 账号 A：credentials 里存的是 user_id 键
+	// 账号 A：只有 user_id，不应成为 OAuth 身份键。
 	idA, err := db.InsertAccountWithCredentials(ctx, "uid-key", map[string]interface{}{
 		"access_token": "at-uid-key",
 		"email":        "solo@example.com",
@@ -260,36 +269,28 @@ func TestFindActiveAccountByOAuthIdentityMatchesUserID(t *testing.T) {
 	if err != nil {
 		t.Fatalf("InsertAccountWithCredentials A 返回错误: %v", err)
 	}
-	got, err := db.FindActiveAccountByOAuthIdentity(ctx, "solo@example.com", "user-abc123")
-	if err != nil {
-		t.Fatalf("match by user_id key 返回错误: %v", err)
-	}
-	if got != idA {
-		t.Fatalf("matched id = %d, want %d", got, idA)
+	if _, err := db.FindActiveAccountByOAuthIdentity(ctx, "solo@example.com", "user-abc123"); err != sql.ErrNoRows {
+		t.Fatalf("match by user_id key err = %v, want sql.ErrNoRows", err)
 	}
 
-	// 账号 B：旧版 wham 回填把 user_id 污染进了 account_id 字段
+	// 账号 B：旧版污染的 account_id 也不应成为新身份键。
 	idB, err := db.InsertAccountWithCredentials(ctx, "polluted", map[string]interface{}{
 		"access_token": "at-polluted",
 		"email":        "legacy@example.com",
-		"account_id":   "user-def456", // 实为 user_id
+		"account_id":   "user-def456", // 历史 user_id 污染
 	}, "")
 	if err != nil {
 		t.Fatalf("InsertAccountWithCredentials B 返回错误: %v", err)
 	}
-	got, err = db.FindActiveAccountByOAuthIdentity(ctx, "legacy@example.com", "user-def456")
-	if err != nil {
-		t.Fatalf("match polluted account_id 返回错误: %v", err)
+	if _, err = db.FindActiveAccountByOAuthIdentity(ctx, "legacy@example.com", "user-def456"); err != sql.ErrNoRows {
+		t.Fatalf("match polluted account_id err = %v, want sql.ErrNoRows", err)
 	}
-	if got != idB {
-		t.Fatalf("matched id = %d, want %d", got, idB)
-	}
+	_ = idA
+	_ = idB
 }
 
-// v2 迁移：user_id 也是身份别名——个人账号（credentials 只有 user_id）和被旧版
-// wham 回填污染（user_id 写进了 account_id）的账号必须合并为一组。
-// 勾选"允许重复添加"强制导入的副本（allow_duplicate 标记）不参与合并。
-func TestSQLiteDataMigrationV2DedupesByUserID(t *testing.T) {
+// 缺少 workspace_id 的账号不会因 user_id 或历史 account_id 值被迁移合并。
+func TestSQLiteDataMigrationDoesNotDedupeWithoutWorkspaceID(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
 	ctx := context.Background()
 
@@ -321,7 +322,7 @@ func TestSQLiteDataMigrationV2DedupesByUserID(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Insert fresh 返回错误: %v", err)
 	}
-	// 强制重复副本：allow_duplicate 标记，身份与上面相同，但必须保留
+	// 强制重复副本：allow_duplicate 标记，但 workspace_id 仍为空，因此保留
 	forcedID, err := db.InsertAccountWithCredentials(ctx, "forced-dup", map[string]interface{}{
 		"access_token":    "at-forced-copy",
 		"email":           "solo@example.com",
@@ -340,8 +341,8 @@ func TestSQLiteDataMigrationV2DedupesByUserID(t *testing.T) {
 	if err := db.conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM accounts WHERE id IN ($1, $2) AND status <> 'deleted' AND COALESCE(error_message, '') <> 'deleted'`, pollutedID, freshID).Scan(&remaining); err != nil {
 		t.Fatalf("查询存活账号数返回错误: %v", err)
 	}
-	if remaining != 1 {
-		t.Fatalf("v2 迁移后存活账号 = %d, want 1（user_id 重复应被合并）", remaining)
+	if remaining != 2 {
+		t.Fatalf("迁移后存活账号 = %d, want 2（空 workspace_id 允许重复）", remaining)
 	}
 
 	var forcedAlive int
@@ -352,11 +353,98 @@ func TestSQLiteDataMigrationV2DedupesByUserID(t *testing.T) {
 		t.Fatal("allow_duplicate 副本被迁移误删，应保留")
 	}
 
-	// 强制副本也不作为身份判重锚点：按身份查找应命中主账号而非副本
-	if got, err := db.FindActiveAccountByOAuthIdentity(ctx, "solo@example.com", "user-dup999"); err != nil {
-		t.Fatalf("FindActiveAccountByOAuthIdentity 返回错误: %v", err)
-	} else if got == forcedID {
-		t.Fatal("身份判重不应命中 allow_duplicate 副本")
+	if _, err := db.FindActiveAccountByOAuthIdentity(ctx, "solo@example.com", "user-dup999"); err != sql.ErrNoRows {
+		t.Fatalf("空 workspace 身份查询 err = %v, want sql.ErrNoRows", err)
+	}
+	_ = forcedID
+}
+
+func TestSQLiteWorkspaceMigrationBackfillsOnlyJWTWorkspaceID(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+	ctx := context.Background()
+	db, err := New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New(sqlite) 返回错误: %v", err)
+	}
+	defer db.Close()
+
+	idToken := databaseTestJWT(t, map[string]interface{}{
+		"email": "migrate@example.com",
+		"https://api.openai.com/auth": map[string]interface{}{
+			"chatgpt_account_id": "workspace-from-jwt",
+			"user_id":            "user-not-workspace",
+		},
+	})
+	id, err := db.InsertAccountWithCredentials(ctx, "legacy", map[string]interface{}{
+		"id_token":      idToken,
+		"account_id":    "user-not-workspace",
+		"refresh_token": "rt-migrate",
+	}, "")
+	if err != nil {
+		t.Fatalf("InsertAccountWithCredentials: %v", err)
+	}
+	if _, err := db.conn.ExecContext(ctx, `DELETE FROM data_migrations WHERE version = $1`, dataMigrationWorkspaceIdentityV3); err != nil {
+		t.Fatalf("清理 workspace migration 标记: %v", err)
+	}
+	if err := db.runDataMigrationsWithTimeout(); err != nil {
+		t.Fatalf("runDataMigrations: %v", err)
+	}
+
+	row, err := db.GetAccountByID(ctx, id)
+	if err != nil {
+		t.Fatalf("GetAccountByID: %v", err)
+	}
+	if got := row.GetCredential("workspace_id"); got != "workspace-from-jwt" {
+		t.Fatalf("workspace_id = %q, want workspace-from-jwt", got)
+	}
+	if got := row.GetCredential("email"); got != "migrate@example.com" {
+		t.Fatalf("email = %q, want migrate@example.com", got)
+	}
+	if got := row.GetCredential("account_id"); got != "user-not-workspace" {
+		t.Fatalf("legacy account_id = %q, want preserved for compatibility", got)
+	}
+	if got, err := db.FindActiveAccountByOAuthIdentity(ctx, "MIGRATE@example.com", "workspace-from-jwt"); err != nil || got != id {
+		t.Fatalf("FindActiveAccountByOAuthIdentity = (%d, %v), want (%d, nil)", got, err, id)
+	}
+}
+
+func TestSQLiteWorkspaceMigrationClearsUserIDWorkspaceValue(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+	ctx := context.Background()
+	db, err := New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New(sqlite): %v", err)
+	}
+	defer db.Close()
+
+	id, err := db.InsertAccountWithCredentials(ctx, "polluted-workspace", map[string]interface{}{
+		"refresh_token": "rt-polluted-workspace",
+		"email":         "polluted@example.com",
+		"workspace_id":  "user-not-a-workspace",
+	}, "")
+	if err != nil {
+		t.Fatalf("InsertAccountWithCredentials: %v", err)
+	}
+	if _, err := db.conn.ExecContext(ctx, `DELETE FROM data_migrations WHERE version = $1`, dataMigrationWorkspaceIdentityV3); err != nil {
+		t.Fatalf("clear workspace migration marker: %v", err)
+	}
+	if err := db.runDataMigrationsWithTimeout(); err != nil {
+		t.Fatalf("runDataMigrations: %v", err)
+	}
+
+	row, err := db.GetAccountByID(ctx, id)
+	if err != nil {
+		t.Fatalf("GetAccountByID: %v", err)
+	}
+	if got := row.GetCredential("workspace_id"); got != "" {
+		t.Fatalf("workspace_id = %q, want empty", got)
+	}
+	ids, err := db.GetAllChatGPTAccountIDs(ctx)
+	if err != nil {
+		t.Fatalf("GetAllChatGPTAccountIDs: %v", err)
+	}
+	if len(ids) != 0 {
+		t.Fatalf("workspace IDs = %#v, want none", ids)
 	}
 }
 
@@ -369,7 +457,7 @@ func TestSQLiteDataMigrationDedupesOAuthIdentityOnce(t *testing.T) {
 		t.Fatalf("New(sqlite) 返回错误: %v", err)
 	}
 
-	if _, err := db.conn.ExecContext(ctx, `DELETE FROM data_migrations WHERE version = $1`, dataMigrationOAuthIdentityDedupeV1); err != nil {
+	if _, err := db.conn.ExecContext(ctx, `DELETE FROM data_migrations WHERE version = $1`, dataMigrationWorkspaceIdentityV3); err != nil {
 		t.Fatalf("清理 data migration 标记返回错误: %v", err)
 	}
 
@@ -380,7 +468,7 @@ func TestSQLiteDataMigrationDedupesOAuthIdentityOnce(t *testing.T) {
 	oldID, err := db.InsertAccountWithCredentials(ctx, "old-duplicate", map[string]interface{}{
 		"refresh_token": "rt-old-duplicate",
 		"email":         "User@Example.com",
-		"account_id":    "acc-dedupe",
+		"workspace_id":  "acc-dedupe",
 	}, "")
 	if err != nil {
 		t.Fatalf("Insert old duplicate 返回错误: %v", err)
@@ -388,7 +476,7 @@ func TestSQLiteDataMigrationDedupesOAuthIdentityOnce(t *testing.T) {
 	midID, err := db.InsertAccountWithCredentials(ctx, "mid-duplicate", map[string]interface{}{
 		"access_token":        "at-mid-duplicate",
 		"email":               "user@example.com",
-		"chatgpt_account_id":  "acc-dedupe",
+		"workspace_id":        "acc-dedupe",
 		"codex_7d_reset_at":   newTime.Format(time.RFC3339),
 		"codex_5h_reset_at":   newTime.Format(time.RFC3339),
 		"codex_usage_marker":  "keep-credentials-intact",
@@ -400,7 +488,7 @@ func TestSQLiteDataMigrationDedupesOAuthIdentityOnce(t *testing.T) {
 	winnerID, err := db.InsertAccountWithCredentials(ctx, "new-duplicate", map[string]interface{}{
 		"session_token": "st-new-duplicate",
 		"email":         " user@example.com ",
-		"account_id":    "acc-dedupe",
+		"workspace_id":  "acc-dedupe",
 	}, "")
 	if err != nil {
 		t.Fatalf("Insert winner 返回错误: %v", err)
@@ -408,16 +496,15 @@ func TestSQLiteDataMigrationDedupesOAuthIdentityOnce(t *testing.T) {
 	otherID, err := db.InsertAccountWithCredentials(ctx, "other-workspace", map[string]interface{}{
 		"refresh_token": "rt-other-workspace",
 		"email":         "user@example.com",
-		"account_id":    "acc-other",
+		"workspace_id":  "acc-other",
 	}, "")
 	if err != nil {
 		t.Fatalf("Insert other 返回错误: %v", err)
 	}
 	bridgeOldID, err := db.InsertAccountWithCredentials(ctx, "bridge-old", map[string]interface{}{
-		"refresh_token":      "rt-bridge-old",
-		"email":              "bridge@example.com",
-		"account_id":         "acc-bridge-old",
-		"chatgpt_account_id": "acc-bridge",
+		"refresh_token": "rt-bridge-old",
+		"email":         "bridge@example.com",
+		"workspace_id":  "acc-bridge",
 	}, "")
 	if err != nil {
 		t.Fatalf("Insert bridge old 返回错误: %v", err)
@@ -425,7 +512,7 @@ func TestSQLiteDataMigrationDedupesOAuthIdentityOnce(t *testing.T) {
 	bridgeWinnerID, err := db.InsertAccountWithCredentials(ctx, "bridge-winner", map[string]interface{}{
 		"access_token": "at-bridge-winner",
 		"email":        "Bridge@Example.com",
-		"account_id":   "acc-bridge",
+		"workspace_id": "acc-bridge",
 	}, "")
 	if err != nil {
 		t.Fatalf("Insert bridge winner 返回错误: %v", err)
@@ -433,7 +520,7 @@ func TestSQLiteDataMigrationDedupesOAuthIdentityOnce(t *testing.T) {
 	deletedID, err := db.InsertAccountWithCredentials(ctx, "deleted-duplicate", map[string]interface{}{
 		"refresh_token": "rt-deleted-duplicate",
 		"email":         "user@example.com",
-		"account_id":    "acc-dedupe",
+		"workspace_id":  "acc-dedupe",
 	}, "")
 	if err != nil {
 		t.Fatalf("Insert deleted 返回错误: %v", err)
@@ -494,7 +581,7 @@ func TestSQLiteDataMigrationDedupesOAuthIdentityOnce(t *testing.T) {
 	}
 
 	var migrationCount int
-	if err := db.conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM data_migrations WHERE version = $1`, dataMigrationOAuthIdentityDedupeV1).Scan(&migrationCount); err != nil {
+	if err := db.conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM data_migrations WHERE version = $1`, dataMigrationWorkspaceIdentityV3).Scan(&migrationCount); err != nil {
 		t.Fatalf("查询 data_migrations 返回错误: %v", err)
 	}
 	if migrationCount != 1 {
@@ -502,7 +589,7 @@ func TestSQLiteDataMigrationDedupesOAuthIdentityOnce(t *testing.T) {
 	}
 
 	var eventCount int
-	if err := db.conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM account_events WHERE source = 'oauth_identity_dedupe_v1' AND account_id IN ($1, $2, $3)`, oldID, midID, bridgeOldID).Scan(&eventCount); err != nil {
+	if err := db.conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM account_events WHERE source = 'workspace_identity_v3' AND account_id IN ($1, $2, $3)`, oldID, midID, bridgeOldID).Scan(&eventCount); err != nil {
 		t.Fatalf("查询 account_events 返回错误: %v", err)
 	}
 	if eventCount != 3 {
@@ -512,7 +599,7 @@ func TestSQLiteDataMigrationDedupesOAuthIdentityOnce(t *testing.T) {
 	postMigrationDuplicateID, err := db.InsertAccountWithCredentials(ctx, "post-migration-duplicate", map[string]interface{}{
 		"refresh_token": "rt-post-migration-duplicate",
 		"email":         "user@example.com",
-		"account_id":    "acc-dedupe",
+		"workspace_id":  "acc-dedupe",
 	}, "")
 	if err != nil {
 		t.Fatalf("Insert post migration duplicate 返回错误: %v", err)
